@@ -1,0 +1,174 @@
+name: alz-lab
+
+# ---------------------------------------------------------------------------
+# PR  -> lint + what-if, result posted as a PR comment. Nothing is deployed.
+# main -> deploy, paused at a protected environment until a human approves.
+#
+# The approval gate is the `environment:` line on the deploy job. Everything
+# else is plumbing.
+# ---------------------------------------------------------------------------
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+  workflow_dispatch:
+    inputs:
+      enforcementMode:
+        description: 'Policy enforcement mode'
+        type: choice
+        options:
+          - DoNotEnforce
+          - Default
+        default: DoNotEnforce
+
+permissions:
+  id-token: write # required for OIDC federated login - without this, azure/login fails
+  contents: read
+  pull-requests: write # required to post the what-if comment
+
+env:
+  MG_PREFIX: alzlab
+  DEPLOY_LOCATION: uaenorth
+  ALLOWED_LOCATIONS: '["uaenorth","uaecentral"]'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Catches syntax errors and lint warnings before burning an Azure round-trip.
+  # -------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build all Bicep templates
+        run: |
+          set -euo pipefail
+          for f in $(find infra -name 'main.bicep'); do
+            echo "==> $f"
+            az bicep build --file "$f" --stdout > /dev/null
+          done
+          az bicep build-params --file infra/management-groups/main.bicepparam --stdout > /dev/null
+
+  # -------------------------------------------------------------------------
+  # What-if. This is what the approver reads before clicking approve.
+  # -------------------------------------------------------------------------
+  whatif:
+    needs: lint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if - management groups
+        run: |
+          az deployment tenant what-if \
+            --name "mg-whatif-${{ github.run_number }}" \
+            --location "$DEPLOY_LOCATION" \
+            --template-file infra/management-groups/main.bicep \
+            --parameters infra/management-groups/main.bicepparam \
+            2>&1 | tee whatif.txt
+
+      # Fails on the very first PR because the management groups do not exist
+      # yet, so nothing can be evaluated at that scope. Expected - it goes green
+      # on the second PR onwards.
+      - name: What-if - policy definitions
+        continue-on-error: true
+        run: |
+          az deployment mg what-if \
+            --name "defs-whatif-${{ github.run_number }}" \
+            --management-group-id "$MG_PREFIX" \
+            --location "$DEPLOY_LOCATION" \
+            --template-file infra/policy/definitions/main.bicep \
+            --parameters allowedLocations="$ALLOWED_LOCATIONS" \
+            2>&1 | tee -a whatif.txt
+
+      - name: Post what-if to the pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            printf '### Bicep what-if\n\n'
+            printf '<details><summary>Expand plan</summary>\n\n'
+            printf '~~~\n'
+            cat whatif.txt
+            printf '~~~\n\n</details>\n'
+          } > comment.md
+          gh pr comment "${{ github.event.number }}" --body-file comment.md
+
+  # -------------------------------------------------------------------------
+  # Deploy. Pauses here until a reviewer approves the `alz-lab` environment.
+  # -------------------------------------------------------------------------
+  deploy:
+    needs: lint
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: alz-lab # <- the approval gate lives here
+    env:
+      ENFORCEMENT_MODE: ${{ github.event.inputs.enforcementMode || 'DoNotEnforce' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy management group hierarchy
+        run: |
+          az deployment tenant create \
+            --name "mg-${{ github.run_number }}" \
+            --location "$DEPLOY_LOCATION" \
+            --template-file infra/management-groups/main.bicep \
+            --parameters infra/management-groups/main.bicepparam
+
+      # Chaining a deployment output into the next deployment. Cleaner than
+      # hardcoding the initiative resource ID in two places.
+      - name: Deploy policy definitions
+        id: defs
+        run: |
+          set -euo pipefail
+          INITIATIVE_ID=$(az deployment mg create \
+            --name "defs-${{ github.run_number }}" \
+            --management-group-id "$MG_PREFIX" \
+            --location "$DEPLOY_LOCATION" \
+            --template-file infra/policy/definitions/main.bicep \
+            --parameters allowedLocations="$ALLOWED_LOCATIONS" \
+            --query properties.outputs.baselineInitiativeId.value -o tsv)
+          echo "initiative_id=$INITIATIVE_ID" >> "$GITHUB_OUTPUT"
+          echo "Initiative: $INITIATIVE_ID"
+
+      - name: Deploy policy assignments
+        run: |
+          az deployment mg create \
+            --name "assign-${{ github.run_number }}" \
+            --management-group-id "$MG_PREFIX" \
+            --location "$DEPLOY_LOCATION" \
+            --template-file infra/policy/assignments/main.bicep \
+            --parameters prefix="$MG_PREFIX" \
+                         initiativeId="${{ steps.defs.outputs.initiative_id }}" \
+                         enforcementMode="$ENFORCEMENT_MODE" \
+                         allowedLocations="$ALLOWED_LOCATIONS"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed"
+            echo ""
+            echo "- Enforcement mode: \`$ENFORCEMENT_MODE\`"
+            echo "- Intermediate root: \`$MG_PREFIX\`"
+            echo "- Allowed regions: \`$ALLOWED_LOCATIONS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
