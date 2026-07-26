@@ -1,0 +1,5 @@
+*.json
+!infra/**/*.parameters.json
+whatif.txt
+comment.md
+.azure/
