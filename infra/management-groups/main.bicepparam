@@ -5,4 +5,4 @@ using './main.bicep'
 // recreated. Pick something you will not want to change.
 param prefix = 'alzlab'
 
-param intermediateRootDisplayName = 'ALZ Lab'
+param intermediateRootDisplayName = 'ALZ Lab v1'
